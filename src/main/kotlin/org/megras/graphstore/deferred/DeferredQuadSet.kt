@@ -7,7 +7,7 @@ import org.megras.id.SemanticId
 
 class DeferredQuadSet internal constructor(
     private val source: QuadSet,
-    private val descriptor: FilterDescriptor = FilterDescriptor.EMPTY
+    internal val descriptor: FilterDescriptor = FilterDescriptor.EMPTY
 ) : MutableQuadSet {
 
     // --- MutableSet<Quad> delegation (mutations pass through to source) ---
@@ -134,14 +134,55 @@ class DeferredQuadSet internal constructor(
         if (descriptor.isImpossible) return BasicQuadSet()
         if (descriptor.isTrivial) return source
 
+        // Resolve implicit filters into subject constraints before dispatching
+        val effectiveDescriptor = resolveImplicitFilters()
+        if (effectiveDescriptor.isImpossible) return BasicQuadSet()
+
         return if (source is AbstractDbStore) {
-            source.materializeFilter(descriptor)
+            source.materializeFilter(effectiveDescriptor)
         } else {
-            materializeViaIterator()
+            materializeViaIterator(effectiveDescriptor)
         }
     }
 
-    private fun materializeViaIterator(): QuadSet {
+    /**
+     * Evaluate [FilterDescriptor.implicitFilters] by querying the source
+     * for each implicit predicate and collecting subjects that satisfy the
+     * relation with the reference subject. The matching subjects are intersected
+     * with any existing subject constraints and baked into the returned descriptor
+     * (implicit filters removed, subjects updated).
+     *
+     * Returns an impossible descriptor when no subjects satisfy an implicit filter.
+     */
+    private fun resolveImplicitFilters(): FilterDescriptor {
+        if (descriptor.implicitFilters.isEmpty()) return descriptor
+
+        var subjectOverride = descriptor.subjects
+        for (imp in descriptor.implicitFilters) {
+            val impSubjects = source
+                .filterPredicate(imp.predicate)
+                .asSequence()
+                .filter { it.`object` == imp.referenceSubject }
+                .map { it.subject }
+                .toSet()
+            if (impSubjects.isEmpty()) {
+                return FilterDescriptor.EMPTY.copy(subjects = emptySet())
+            }
+            subjectOverride = if (subjectOverride == null) impSubjects
+                             else subjectOverride.intersect(impSubjects).toHashSet()
+            if (subjectOverride.isEmpty()) {
+                return FilterDescriptor.EMPTY.copy(subjects = emptySet())
+            }
+        }
+        return descriptor.copy(
+            implicitFilters = emptyList(),
+            subjects = subjectOverride,
+        )
+    }
+
+    private fun materializeViaIterator(
+        descriptor: FilterDescriptor = this.descriptor
+    ): QuadSet {
         val subjectSet = descriptor.subjects?.toHashSet()
         val predicateSet = descriptor.predicates?.toHashSet()
         val objectSet = descriptor.objects?.toHashSet()

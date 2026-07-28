@@ -510,6 +510,11 @@ override fun insertVectorValueIds(vectorValues: Set<VectorValue>): Map<VectorVal
 
     private val idCache = CacheBuilder.newBuilder().maximumSize(cacheSize).build<Long, Triple<QuadValueId, QuadValueId, QuadValueId>>()
 
+    private val predicateCardinalityCache = CacheBuilder.newBuilder()
+        .maximumSize(1000L)
+        .expireAfterWrite(5, java.util.concurrent.TimeUnit.MINUTES)
+        .build<QuadValueId, Long>()
+
     private fun getIds(ids: Collection<Long>): QuadSet {
         if (ids.isEmpty()) {
             return BasicQuadSet()
@@ -1268,7 +1273,28 @@ override fun insertVectorValueIds(vectorValues: Set<VectorValue>): Map<VectorVal
         return result
     }
 
+    /**
+     * Build SQL for a FilterDescriptor, choosing between simple and CTE-based approaches.
+     * Simple descriptors use a straightforward query (fewer CTEs = faster planning).
+     * Complex descriptors use CTEs for better composability and optimization.
+     */
     private fun buildMaterializedSql(
+        descriptor: FilterDescriptor,
+        filterIds: Map<QuadValue, QuadValueId>
+    ): String {
+        return if (descriptor.isComposable) {
+            buildSimpleMaterializedSql(descriptor, filterIds)
+        } else {
+            buildCteMaterializedSql(descriptor, filterIds)
+        }
+    }
+
+    /**
+     * Build a simple non-CTE SQL query for a FilterDescriptor.
+     * This is the original approach — a single SELECT with JOINs and WHERE conditions.
+     * Best for simple descriptors where CTE overhead is unnecessary.
+     */
+    private fun buildSimpleMaterializedSql(
         descriptor: FilterDescriptor,
         filterIds: Map<QuadValue, QuadValueId>
     ): String {
@@ -1390,6 +1416,26 @@ override fun insertVectorValueIds(vectorValues: Set<VectorValue>): Map<VectorVal
         return sb.toString()
     }
 
+    /**
+     * Build a CTE-based SQL query for a FilterDescriptor.
+     * CTEs (WITH clauses) enable better query planning for complex descriptors
+     * by allowing PostgreSQL to materialize intermediate results.
+     *
+     * Currently delegates to buildSimpleMaterializedSql as a fallback.
+     * The CTE structure is ready for future optimization stages.
+     */
+    private fun buildCteMaterializedSql(
+        descriptor: FilterDescriptor,
+        filterIds: Map<QuadValue, QuadValueId>
+    ): String {
+        // For now, delegate to the simple builder.
+        // Future stages will emit CTE-based SQL here with:
+        //   - Separate CTEs for each filter dimension (subjects, predicates, objects)
+        //   - Materialized CTEs with explicit MATERIALIZED hints
+        //   - Progressive refinement through CTE chains
+        return buildSimpleMaterializedSql(descriptor, filterIds)
+    }
+
     private fun buildOrChainForFilter(
         typeCol: String,
         idCol: String,
@@ -1496,6 +1542,25 @@ override fun insertVectorValueIds(vectorValues: Set<VectorValue>): Map<VectorVal
         }
 
         return quadValues.values.toSet()
+    }
+
+    override fun estimatePredicateCardinality(predicate: QuadValue): Long? {
+        val pId = getQuadValueId(predicate)
+        if (pId.first == null || pId.second == null) return null
+
+        val key = pId.first!! to pId.second!!
+        val cached = predicateCardinalityCache.getIfPresent(key)
+        if (cached != null) return cached
+
+        val count = transaction {
+            exec("SELECT COUNT(*)::bigint FROM quads WHERE p_type = ${pId.first} AND p = ${pId.second}") { rs ->
+                rs.next()
+                rs.getLong(1)
+            } ?: 0L
+        }
+
+        predicateCardinalityCache.put(key, count)
+        return count
     }
 
     override val size: Int

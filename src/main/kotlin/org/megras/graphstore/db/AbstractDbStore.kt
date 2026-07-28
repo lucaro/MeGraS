@@ -805,6 +805,13 @@ abstract class AbstractDbStore : MutableQuadSet {
         return result
     }
 
+    /**
+     * Estimate the number of quads matching the given predicate.
+     * Returns null if no estimate is available (caller should use heuristics).
+     * Subclasses override to provide accurate estimates (e.g., from pg_stats).
+     */
+    open fun estimatePredicateCardinality(predicate: QuadValue): Long? = null
+
     open fun dump(writer: Writer, chunkSize: Int) {
         TODO("Not yet implemented")
     }

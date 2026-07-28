@@ -1077,4 +1077,213 @@ class DeferredQuadSetCorrectnessTest {
             pgResult.map { Triple(it.subject, it.predicate, it.`object`) }
         )
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  J. FilterDescriptor V2 features
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `v2 - ImplicitFilter created with predicate and reference`() {
+        val imp = FilterDescriptor.ImplicitFilter(
+            predicate = p1,
+            referenceSubject = s1,
+            parameters = mapOf("distance" to 100.0)
+        )
+        assertEquals(p1, imp.predicate)
+        assertEquals(s1, imp.referenceSubject)
+        assertEquals(mapOf("distance" to 100.0), imp.parameters)
+    }
+
+    @Test
+    fun `v2 - withImplicitFilter adds to descriptor`() {
+        val d = FilterDescriptor.EMPTY.withImplicitFilter(p1, s1)
+        assertEquals(1, d.implicitFilters.size)
+        assertEquals(p1, d.implicitFilters[0].predicate)
+    }
+
+    @Test
+    fun `v2 - withImplicitFilter increments depth`() {
+        val d = FilterDescriptor.EMPTY.withImplicitFilter(p1, s1)
+        assertEquals(1, d.depth)
+    }
+
+    @Test
+    fun `v2 - implicitFilters make descriptor non-trivial`() {
+        val d = FilterDescriptor.EMPTY.withImplicitFilter(p1, s1)
+        assertFalse(d.isTrivial)
+    }
+
+    @Test
+    fun `v2 - withSelectivityHint adds hint`() {
+        val d = FilterDescriptor.EMPTY.withSelectivityHint(p1, 0.05)
+        assertEquals(1, d.selectivityHints.size)
+        assertEquals(0.05, d.selectivityHints[0].estimatedSelectivity, 0.001)
+    }
+
+    @Test
+    fun `v2 - withSelectivityHint increments depth`() {
+        val d = FilterDescriptor.EMPTY.withSelectivityHint(p1, 0.05)
+        assertEquals(1, d.depth)
+    }
+
+    @Test
+    fun `v2 - multiple withImplicitFilter accumulates`() {
+        val d = FilterDescriptor.EMPTY
+            .withImplicitFilter(p1, s1)
+            .withImplicitFilter(p2, s2, mapOf("min" to 1.0))
+        assertEquals(2, d.implicitFilters.size)
+        assertEquals(2, d.depth)
+    }
+
+    @Test
+    fun `v2 - isSqlPushDownCandidate true for range filter`() {
+        val d = FilterDescriptor.EMPTY.withRangeFilter(p2, 0.0, 10.0)
+        assertTrue(d.isSqlPushDownCandidate())
+    }
+
+    @Test
+    fun `v2 - isSqlPushDownCandidate true for text filter`() {
+        val d = FilterDescriptor.EMPTY.withTextFilter(pt, "test")
+        assertTrue(d.isSqlPushDownCandidate())
+    }
+
+    @Test
+    fun `v2 - isSqlPushDownCandidate true for large exclusion set`() {
+        val bigExcluded = (1..101).map { QuadValue.of("http://ex/$it") }
+        val d = FilterDescriptor.EMPTY.withExclusionFilter(p1, bigExcluded)
+        assertTrue(d.isSqlPushDownCandidate())
+    }
+
+    @Test
+    fun `v2 - isSqlPushDownCandidate true for ordering with limit`() {
+        val d = FilterDescriptor.EMPTY.withOrdering(
+            listOf(OrderSpec(QuadComponent.OBJECT, true)), limit = 10
+        )
+        assertTrue(d.isSqlPushDownCandidate())
+    }
+
+    @Test
+    fun `v2 - isSqlPushDownCandidate false for simple set filter`() {
+        val d = FilterDescriptor.EMPTY.mergeFilter(setOf(s1), null, null)
+        assertFalse(d.isSqlPushDownCandidate())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  K. ImplicitFilter end-to-end resolution
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** Shared implicit-relation test predicate */
+    private val pImplicitRel = QuadValue.of("http://ex/implicitContains")
+
+    @Test
+    fun `v2 - implicitFilterResolved restricts subjects via materialize`() {
+        val corpus = setOf(
+            Quad(s1, p1, ou1),
+            Quad(s2, p1, ou2),
+            Quad(s3, p2, ou3),
+            Quad(s1, pImplicitRel, s2),   // s1 -> s2 via pImplicitRel
+            Quad(ou2, pImplicitRel, s1),  // ou2 -> s1 via pImplicitRel
+        )
+        val bqs = BasicQuadSet(corpus)
+        val dqs = DeferredQuadSet(bqs, FilterDescriptor.EMPTY.withImplicitFilter(pImplicitRel, s2))
+        val result = dqs.materialize()
+        // pImplicitRel with refSubject=s2 → subjects where object==s2 → just s1
+        // So only quads with subject s1
+        assertEquals(2, result.size)
+        assertTrue(result.all { it.subject == s1 })
+    }
+
+    @Test
+    fun `v2 - implicitFilterResolved with no matching subjects returns empty`() {
+        val corpus = setOf(
+            Quad(s1, p1, ou1),
+            Quad(s1, pImplicitRel, s2),  // only s1 has explicit rel, object is s2
+        )
+        val bqs = BasicQuadSet(corpus)
+        val dqs = DeferredQuadSet(bqs, FilterDescriptor.EMPTY.withImplicitFilter(pImplicitRel, s1))
+        val result = dqs.materialize()
+        // source.filterPredicate(pImplicitRel) → Quad(s1,pImplicitRel,s2)
+        // filter where object==s1 → none
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `v2 - implicitFilterResolved with existing subject filter intersection`() {
+        val corpus = setOf(
+            Quad(s1, p1, ou1),
+            Quad(s2, p1, ou2),
+            Quad(s3, p1, ou1),
+            Quad(s1, pImplicitRel, s2),
+            Quad(s2, pImplicitRel, s3),
+            Quad(s3, pImplicitRel, s3),
+        )
+        val bqs = BasicQuadSet(corpus)
+        val dqs = DeferredQuadSet(
+            bqs,
+            FilterDescriptor.EMPTY
+                .mergeFilter(null, null, setOf(ou1))  // must have object ou1
+                .withImplicitFilter(pImplicitRel, s3)  // must implicitly relate to s3
+        )
+        val result = dqs.materialize()
+        // ImplicitFilter(pImplicitRel, s3): subjects where object==s3 via pImplicitRel → {s2, s3}
+        // Object filter: ou1 → only quads with object ou1
+        // Subjects {s2, s3} that also have object ou1 → Quad(s3, p1, ou1)
+        assertEquals(1, result.size)
+        assertEquals(s3, result.first().subject)
+        assertEquals(p1, result.first().predicate)
+        assertEquals(ou1, result.first().`object`)
+    }
+
+    @Test
+    fun `v2 - multipleImplicitFilters intersected`() {
+        val corpus = setOf(
+            Quad(s1, p1, ou1),
+            Quad(s2, p1, ou2),
+            Quad(ou1, pImplicitRel, s1),  // ou1 -> s1
+            Quad(s2, pImplicitRel, s1),   // s2 -> s1
+            Quad(ou1, p2, s2),            // ou1 -> s2 (second implicit predicate)
+            Quad(s1, p2, s2),             // s1 -> s2
+        )
+        val bqs = BasicQuadSet(corpus)
+        val dqs = DeferredQuadSet(
+            bqs,
+            FilterDescriptor.EMPTY
+                .withImplicitFilter(pImplicitRel, s1)   // subjects related to s1 via pImplicitRel → {ou1, s2}
+                .withImplicitFilter(p2, s2)             // subjects related to s2 via p2 → {ou1, s1}
+                // Intersection of {ou1, s2} and {ou1, s1} → {ou1}
+        )
+        val result = dqs.materialize()
+        // all quads with subject = ou1
+        assertEquals(2, result.size)
+        assertTrue(result.all { it.subject == ou1 })
+    }
+
+    @Test
+    fun `v2 - implicitFilterResolved after deferred composition`() {
+        val corpus = setOf(
+            Quad(s1, p1, ou1),
+            Quad(s2, p1, ou2),
+            Quad(ou1, p1, ou3),
+            Quad(s1, pImplicitRel, s2),   // s1 -> s2 via pImplicitRel
+            Quad(s2, pImplicitRel, s2),   // s2 -> s2 via pImplicitRel
+        )
+        val bqs = BasicQuadSet(corpus)
+        val dqs = DeferredQuadSet
+            .from(bqs)
+            .filterPredicate(p1) as DeferredQuadSet
+        // Manually add ImplicitFilter via descriptor copy
+        val withImpl = DeferredQuadSet(
+            bqs,
+            dqs.descriptor.copy(
+                implicitFilters = listOf(
+                    FilterDescriptor.ImplicitFilter(pImplicitRel, s2)
+                )
+            )
+        )
+        val result = withImpl.materialize()
+        // ImplicitFilter: subjects where object==s2 → {s1, s2}
+        // Predicate filter: p1
+        // Result: Quad(s1, p1, ou1), Quad(s2, p1, ou2)
+        assertEquals(2, result.size)
+    }
 }
